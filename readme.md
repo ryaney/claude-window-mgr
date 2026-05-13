@@ -11,15 +11,16 @@
 
 ### 添加到 PATH
 
-```bash
-# ~/.zshrc
-export PATH="$HOME/.local/bin:$HOME/MyCode/scripts/pic:$PATH"
-```
+将脚本所在目录添加到 `~/.zshrc`（或 `~/.bashrc`），并确认可执行：
 
 ```bash
+# 假设 claude-mgr 放在 ~/scripts 下，按实际路径替换
+echo 'export PATH="$HOME/.local/bin:$HOME/scripts:$PATH"' >> ~/.zshrc
 source ~/.zshrc
-chmod +x ~/MyCode/scripts/pic/claude-mgr
+chmod +x ~/scripts/claude-mgr
 ```
+
+> `~/.local/bin` 是 tmux 自动编译安装的位置，也需要在 PATH 中。
 
 ## 快速开始
 
@@ -245,5 +246,5 @@ claude-mgr resume my-session
 ```bash
 rm -rf ~/.claude-mgr          # 删除所有会话数据
 rm ~/.local/bin/tmux           # 删除本地编译的 tmux
-rm ~/MyCode/scripts/pic/claude-mgr  # 删除脚本
+rm /path/to/claude-mgr            # 删除脚本（替换为实际路径）
 ```

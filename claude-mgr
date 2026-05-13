@@ -479,6 +479,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
     MGR_DIR.mkdir(parents=True, exist_ok=True)
     print(f"  {GREEN}✓{RST} Data directory: {MGR_DIR}")
 
+    # Check if this script's directory is on PATH
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in os.environ.get("PATH", "").split(":"):
+        print(f"\n  {YELLOW}Tip:{RST} add this directory to your PATH:")
+        print(f"    echo 'export PATH=\"$HOME/.local/bin:{script_dir}:$PATH\"' >> ~/.zshrc")
+        print(f"    source ~/.zshrc")
+
     print(f"\n{GREEN}Ready!{RST}  Create your first session:")
     print(f"  {BOLD}claude-mgr new <name> --task \"...\"{RST}")
     return 0
