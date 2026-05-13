@@ -1,0 +1,1097 @@
+#!/usr/bin/env python3
+"""
+Claude Multi-Window Manager (claude-mgr)
+=========================================
+Manage multiple Claude Code sessions in tmux windows from a single
+control interface.  Create sessions, assign tasks, monitor progress,
+send messages, and persist context so each window can resume where
+it left off.
+
+Requirements:  tmux  (auto-installed to ~/.local/bin on first run if missing)
+               claude CLI
+
+Quick start
+-----------
+  claude-mgr new backend --dir ~/projects/api --task "Build REST API"
+  claude-mgr new frontend --task "Create React dashboard"
+  claude-mgr ls
+  claude-mgr dashboard
+  claude-mgr attach backend
+  claude-mgr send backend "run the tests"
+  claude-mgr stop backend
+  claude-mgr resume backend
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+
+# Ensure ~/.local/bin is on PATH (for locally-built tmux)
+_local_bin = os.path.expanduser("~/.local/bin")
+if os.path.isdir(_local_bin) and _local_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = f"{_local_bin}:{os.environ['PATH']}"
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ── tmux discovery ────────────────────────────────────────────────────────
+
+def _find_tmux() -> str:
+    """Find tmux binary.  Check PATH and common locations."""
+    # check PATH
+    for p in os.environ.get("PATH", "").split(":"):
+        candidate = os.path.join(p, "tmux")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    # check common locations
+    for d in ["$HOME/.local/bin", "$HOME/bin", "/usr/local/bin", "/opt/homebrew/bin"]:
+        candidate = os.path.expandvars(os.path.join(d, "tmux"))
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return "tmux"  # fallback – let it fail with a clear error
+
+
+TMUX = _find_tmux()
+
+# ── constants ──────────────────────────────────────────────────────────────
+
+MGR_DIR       = Path.home() / ".claude-mgr"
+SESSIONS_FILE = MGR_DIR / "sessions.json"
+LOG_FILE      = MGR_DIR / "mgr.log"
+TMUX_SESSION  = "claude-mgr"        # master tmux session name
+DASHBOARD_WIN = "_dashboard"        # reserved window 0 name
+
+# ANSI
+_TTY  = sys.stdout.isatty()
+BOLD  = "\033[1m" if _TTY else ""
+DIM   = "\033[2m" if _TTY else ""
+GREEN = "\033[32m" if _TTY else ""
+YELLOW= "\033[33m" if _TTY else ""
+BLUE  = "\033[34m" if _TTY else ""
+CYAN  = "\033[36m" if _TTY else ""
+RED   = "\033[31m" if _TTY else ""
+RST   = "\033[0m" if _TTY else ""
+
+STATUS_ICONS = {"running": "●", "stopped": "○", "starting": "◐", "error": "✕"}
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def log(msg: str) -> None:
+    MGR_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{ts}] {msg}\n")
+
+
+def _run(cmd: list[str], check: bool = True, silent: bool = True,
+         timeout: int = 30) -> subprocess.CompletedProcess:
+    log(f"run: {' '.join(shlex.quote(str(x)) for x in cmd)}")
+    return subprocess.run(cmd, capture_output=silent, text=True,
+                          check=check, timeout=timeout)
+
+
+def run_ok(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    try:
+        return _run(cmd, check=True, **kw)
+    except subprocess.CalledProcessError as e:
+        return e
+
+
+# ── tmux backend ───────────────────────────────────────────────────────────
+#
+# One tmux session ("claude-mgr") holds all Claude windows.
+#   Window 0  –  "_dashboard" placeholder
+#   Window 1+ –  one per Claude session, named after the session
+#
+# Key tmux commands used:
+#   new-session -d -s claude-mgr ...    create detached master session
+#   new-window  -t claude-mgr -n <name> create a window for a Claude session
+#   send-keys   -t claude-mgr:<win>     send text / Enter to a window
+#   capture-pane -t claude-mgr:<win> -p capture visible pane content
+#   kill-window -t claude-mgr:<win>     kill a session's window
+#   attach-session -t claude-mgr        attach to the whole tmux session
+#   select-window -t claude-mgr:<win>   switch focus to a window
+#   has-session -t claude-mgr           check if master session exists
+#   list-windows -t claude-mgr          enumerate windows
+#
+
+def _ensure_tmux_session() -> None:
+    """Create the master tmux session if it doesn't exist."""
+    p = run_ok([TMUX, "has-session", "-t", TMUX_SESSION])
+    if p.returncode != 0:
+        _run([TMUX, "new-session", "-d", "-s", TMUX_SESSION,
+              "-n", DASHBOARD_WIN, "-c", str(Path.home())])
+        log(f"Created tmux session '{TMUX_SESSION}'")
+
+
+def _next_window_index() -> int:
+    """Find the next available window index."""
+    p = run_ok([TMUX, "list-windows", "-t", TMUX_SESSION,
+                "-F", "#{window_index}"])
+    existing = {int(x) for x in p.stdout.strip().split("\n") if x}
+    idx = 1
+    while idx in existing:
+        idx += 1
+    return idx
+
+
+def tmux_window_exists(name: str) -> bool:
+    """Check if a window with the given name exists in the tmux session."""
+    if not _tmux_session_alive():
+        return False
+    p = run_ok([TMUX, "list-windows", "-t", TMUX_SESSION,
+                "-F", "#{window_name}"])
+    return name in p.stdout.strip().split("\n")
+
+
+def _tmux_session_alive() -> bool:
+    p = run_ok([TMUX, "has-session", "-t", TMUX_SESSION])
+    return p.returncode == 0
+
+
+def _window_index(name: str) -> int | None:
+    """Get the window index for a named window."""
+    p = run_ok([TMUX, "list-windows", "-t", TMUX_SESSION,
+                "-F", "#{window_index} #{window_name}"])
+    for line in p.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split(" ", 1)
+        if len(parts) == 2 and parts[1] == name:
+            return int(parts[0])
+    return None
+
+
+def tmux_create_window(name: str, cwd: str, claude_cmd: list[str]) -> bool:
+    """Create a new tmux window running the claude command."""
+    _ensure_tmux_session()
+
+    cwd = os.path.abspath(os.path.expanduser(cwd))
+    os.makedirs(cwd, exist_ok=True)
+
+    cmd_str = " ".join(shlex.quote(x) for x in claude_cmd)
+    # Wrap in bash so we can cd first
+    shell_cmd = f"cd {shlex.quote(cwd)} && {cmd_str}"
+
+    idx = _next_window_index()
+    r = run_ok([TMUX, "new-window", "-t", f"{TMUX_SESSION}:{idx}",
+                "-n", name, "-c", cwd, "bash", "-c", shell_cmd])
+    if r.returncode != 0:
+        log(f"Failed to create window '{name}': {r.stderr}")
+        return False
+    log(f"Created window {idx} '{name}' in {cwd}")
+    return True
+
+
+def tmux_kill_window(name: str) -> bool:
+    """Kill a tmux window by name."""
+    idx = _window_index(name)
+    if idx is None:
+        return False
+    run_ok([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{idx}"])
+    log(f"Killed window '{name}' (index {idx})")
+    return True
+
+
+def tmux_send_keys(name: str, text: str) -> bool:
+    """Send literal text to a window (like typing)."""
+    idx = _window_index(name)
+    if idx is None:
+        return False
+    run_ok([TMUX, "send-keys", "-t", f"{TMUX_SESSION}:{idx}", "-l", text])
+    return True
+
+
+def tmux_send_enter(name: str) -> bool:
+    """Send Enter key to a window."""
+    idx = _window_index(name)
+    if idx is None:
+        return False
+    run_ok([TMUX, "send-keys", "-t", f"{TMUX_SESSION}:{idx}", "Enter"])
+    return True
+
+
+def tmux_capture_pane(name: str, lines: int = 20) -> str:
+    """Capture the visible content of a window's active pane."""
+    idx = _window_index(name)
+    if idx is None:
+        return ""
+    p = run_ok([TMUX, "capture-pane", "-t", f"{TMUX_SESSION}:{idx}",
+                "-p", "-S", f"-{lines}", "-J"])
+    return p.stdout
+
+
+def tmux_list_windows() -> list[str]:
+    """Return list of window names in the tmux session."""
+    if not _tmux_session_alive():
+        return []
+    p = run_ok([TMUX, "list-windows", "-t", TMUX_SESSION,
+                "-F", "#{window_name}"])
+    names = [n for n in p.stdout.strip().split("\n") if n and n != DASHBOARD_WIN]
+    return names
+
+
+# ── session persistence ────────────────────────────────────────────────────
+
+def load_sessions() -> dict:
+    if not SESSIONS_FILE.exists():
+        return {}
+    try:
+        return json.loads(SESSIONS_FILE.read_text()).get("sessions", {})
+    except (json.JSONDecodeError, KeyError):
+        return {}
+
+
+def save_sessions(sessions: dict) -> None:
+    MGR_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_FILE.write_text(json.dumps({
+        "version": 3,
+        "updated": datetime.now().isoformat(),
+        "sessions": sessions,
+    }, indent=2, ensure_ascii=False))
+
+
+def get_session(name: str) -> dict | None:
+    """Get session data; auto-discovers unmanaged tmux windows."""
+    data = load_sessions().get(name)
+    if data:
+        return data
+    if tmux_window_exists(name):
+        return {
+            "name": name, "cwd": os.getcwd(), "task": "",
+            "status": "running",
+            "last_active": datetime.now().isoformat(),
+        }
+    return None
+
+
+def set_session(name: str, data: dict) -> None:
+    sessions = load_sessions()
+    sessions[name] = data
+    save_sessions(sessions)
+
+
+def delete_session_record(name: str) -> None:
+    sessions = load_sessions()
+    sessions.pop(name, None)
+    save_sessions(sessions)
+
+
+# ── claude session discovery ───────────────────────────────────────────────
+
+def find_claude_sessions() -> list[dict]:
+    """Discover existing Claude sessions from ~/.claude/projects/."""
+    results = []
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.is_dir():
+        return results
+    for proj_dir in projects_dir.iterdir():
+        sessions_dir = proj_dir / "sessions"
+        if not sessions_dir.is_dir():
+            continue
+        for session_dir in sessions_dir.iterdir():
+            meta_file = session_dir / "session.json"
+            if not meta_file.exists():
+                continue
+            try:
+                meta = json.loads(meta_file.read_text())
+                results.append({
+                    "session_id": meta.get("sessionId", session_dir.name),
+                    "name": meta.get("name", ""),
+                    "cwd": meta.get("cwd", str(proj_dir)),
+                    "updated": meta.get("updatedAt", ""),
+                })
+            except (json.JSONDecodeError, KeyError):
+                pass
+    results.sort(key=lambda x: x.get("updated", ""), reverse=True)
+    return results
+
+
+# ── display helpers ────────────────────────────────────────────────────────
+
+def fmt_duration(iso_str: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        delta = datetime.now() - dt
+        if delta < timedelta(minutes=1):
+            return "just now"
+        if delta < timedelta(hours=1):
+            return f"{int(delta.total_seconds() // 60)}m ago"
+        if delta < timedelta(days=1):
+            return f"{int(delta.total_seconds() // 3600)}h ago"
+        return f"{delta.days}d ago"
+    except Exception:
+        return "?"
+
+
+def _trunc(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n-1] + "…"
+
+
+def _clean_ansi(text: str) -> str:
+    """Strip ANSI escape sequences for clean terminal display."""
+    c = re.sub(r'\x1b\[[?>]?[0-9;]*[a-zA-Z]', '', text)
+    c = re.sub(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', '', c)
+    c = re.sub(r'\x1b[^\x1b]', '', c)
+    return c.replace('\x0f', '')
+
+
+def format_row(name: str, data: dict) -> str:
+    running = tmux_window_exists(name)
+    icon = STATUS_ICONS["running"] if running else STATUS_ICONS["stopped"]
+    color = GREEN if running else DIM
+    icon_str = f"{color}{icon}{RST}"
+    task = _trunc(data.get("task") or "", 42)
+    cwd  = _trunc((data.get("cwd") or "").replace(str(Path.home()), "~"), 32)
+    last = fmt_duration(data.get("last_active", ""))
+    idx  = _window_index(name)
+    idx_str = f"w{idx}" if idx is not None else "-"
+    return (f" {icon_str} {BOLD}{name:<20}{RST} "
+            f"{DIM}{idx_str:<4}{RST} "
+            f"{task:<44} "
+            f"{DIM}{cwd:<34}{RST} "
+            f"{DIM}{last}{RST}")
+
+
+def print_divider(left: str = "", right: str = "", width: int = 0) -> None:
+    if width == 0:
+        width = shutil.get_terminal_size((120, 40)).columns
+    if left and right:
+        mid = max(width - len(left) - len(right) - 2, 2)
+        print(f"{left} {'─' * mid} {right}")
+    else:
+        print("─" * width)
+
+
+# ── commands ───────────────────────────────────────────────────────────────
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Install/check tmux and initialize the manager."""
+    print(f"{BOLD}Claude Multi-Window Manager — Setup{RST}\n")
+
+    # Check tmux
+    tmux_path = _find_tmux()
+    if tmux_path != "tmux" or shutil.which("tmux"):
+        print(f"  {GREEN}✓{RST} tmux found: {tmux_path}")
+    else:
+        print(f"  {YELLOW}○{RST} tmux not found.  Attempting to build from source...")
+        # Try brew first
+        if shutil.which("brew"):
+            p = run_ok(["brew", "install", "tmux"])
+            if p.returncode == 0:
+                print(f"  {GREEN}✓{RST} tmux installed via Homebrew")
+            else:
+                print(f"  {YELLOW}!{RST} brew install failed — trying source build...")
+                return _build_tmux()
+        else:
+            return _build_tmux()
+
+    # Check claude
+    if shutil.which("claude"):
+        print(f"  {GREEN}✓{RST} claude found: {shutil.which('claude')}")
+    else:
+        print(f"  {RED}✕{RST} claude not found. Please install Claude Code first.")
+        return 1
+
+    MGR_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"  {GREEN}✓{RST} Data directory: {MGR_DIR}")
+
+    print(f"\n{GREEN}Ready!{RST}  Create your first session:")
+    print(f"  {BOLD}claude-mgr new <name> --task \"...\"{RST}")
+    return 0
+
+
+def _build_tmux() -> int:
+    """Build tmux from source and install to ~/.local/bin."""
+    import tempfile
+    import urllib.request
+    import tarfile
+
+    print("  Downloading tmux source...")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tarball = os.path.join(tmp, "tmux.tar.gz")
+            urllib.request.urlretrieve(
+                "https://github.com/tmux/tmux/releases/download/3.5a/tmux-3.5a.tar.gz",
+                tarball
+            )
+            with tarfile.open(tarball) as tf:
+                tf.extractall(tmp)
+            src_dir = os.path.join(tmp, "tmux-3.5a")
+            prefix = os.path.expanduser("~/.local")
+            os.makedirs(prefix, exist_ok=True)
+
+            _run(["bash", "-c",
+                  f"cd {shlex.quote(src_dir)} && "
+                  f"./configure --prefix={shlex.quote(prefix)} --disable-utf8proc && "
+                  f"make -j4 && make install"],
+                 silent=False, timeout=120)
+
+            tmux_bin = os.path.join(prefix, "bin", "tmux")
+            if os.path.isfile(tmux_bin):
+                global TMUX
+                TMUX = tmux_bin
+                print(f"  {GREEN}✓{RST} tmux built and installed: {tmux_bin}")
+                return 0
+            else:
+                print(f"  {RED}✕{RST} build completed but binary not found")
+                return 1
+    except Exception as e:
+        print(f"  {RED}✕{RST} build failed: {e}")
+        return 1
+
+
+def cmd_new(args: argparse.Namespace) -> int:
+    """Create a new Claude session in a tmux window."""
+    name = args.name
+    if not re.match(r'^[a-zA-Z0-9_.-]+$', name):
+        print(f"{RED}Error:{RST} session name must be alphanumeric (a-z, 0-9, _, -, .)")
+        return 1
+
+    if tmux_window_exists(name):
+        print(f"{RED}Error:{RST} session '{name}' is already running.")
+        print(f"  Attach: {BOLD}claude-mgr attach {name}{RST}")
+        return 1
+
+    if get_session(name):
+        print(f"{RED}Error:{RST} a stopped session '{name}' exists.")
+        print(f"  Resume: {BOLD}claude-mgr resume {name}{RST}")
+        return 1
+
+    # Resolve session_id
+    session_id = args.session_id
+    if args.resume_from:
+        for s in find_claude_sessions():
+            if s.get("name") == args.resume_from:
+                session_id = s["session_id"]
+                print(f"{BLUE}Found{RST} Claude session: {s['name']} ({session_id[:8]}...)")
+                break
+        if not session_id:
+            print(f"{YELLOW}Warning:{RST} no session named '{args.resume_from}' "
+                  f"found. Starting fresh.")
+
+    cwd = args.dir or os.getcwd()
+    task = args.task or ""
+
+    cmd_parts = ["claude"]
+    if session_id:
+        cmd_parts += ["--resume", session_id]
+        if name:
+            cmd_parts += ["--name", name]
+    else:
+        cmd_parts += ["--name", name]
+    if args.model:
+        cmd_parts += ["--model", args.model]
+    if args.effort:
+        cmd_parts += ["--effort", args.effort]
+    if task:
+        cmd_parts += ["--append-system-prompt",
+                      f"Your assigned task: {task}. Session name: {name}"]
+
+    if not tmux_create_window(name, cwd, cmd_parts):
+        print(f"{RED}Error:{RST} failed to create tmux window.")
+        return 1
+
+    set_session(name, {
+        "name": name, "cwd": cwd, "task": task,
+        "model": args.model or "", "effort": args.effort or "",
+        "session_id": session_id,
+        "created": datetime.now().isoformat(),
+        "last_active": datetime.now().isoformat(),
+        "status": "running",
+    })
+
+    print(f"{GREEN}Created{RST} session '{name}'")
+    if task:
+        print(f"  Task:      {task}")
+    print(f"  Directory: {cwd}")
+    if session_id:
+        print(f"  Resuming:  {session_id[:8]}...")
+    print(f"\nAttach: {BOLD}claude-mgr attach {name}{RST}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    sessions = load_sessions()
+    tmux_names = set(tmux_list_windows())
+    for sn in tmux_names:
+        if sn not in sessions:
+            sessions[sn] = {
+                "name": sn, "cwd": os.getcwd(), "task": "",
+                "status": "running",
+                "last_active": datetime.now().isoformat(),
+            }
+
+    if not sessions:
+        print(f"{DIM}No sessions yet.{RST}")
+        print(f"Create: {BOLD}claude-mgr new <name> --task \"...\"{RST}")
+        return 0
+
+    for name, data in sessions.items():
+        data["_running"] = tmux_window_exists(name)
+
+    print(f"\n{BOLD}Claude Sessions{RST}\n")
+    print_divider()
+    print(f" {' ':<1} {BOLD}{'NAME':<20} {'WIN':<4} {'TASK':<44} {'DIR':<34} {'LAST ACTIVE'}{RST}")
+    print_divider()
+
+    def _sk(item):
+        name, data = item
+        return (0 if data.get("_running") else 1, data.get("last_active", ""))
+
+    for name, data in sorted(sessions.items(), key=_sk):
+        print(format_row(name, data))
+
+    print_divider()
+    running = sum(1 for d in sessions.values() if d.get("_running"))
+    print(f"{GREEN}● {running} running{RST}  "
+          f"{DIM}○ {len(sessions) - running} stopped{RST}  "
+          f"total: {len(sessions)}  "
+          f"tmux: {BOLD}{TMUX_SESSION}{RST}")
+
+    if args.all:
+        all_s = find_claude_sessions()
+        managed_ids = {d.get("session_id") for d in sessions.values() if d.get("session_id")}
+        unmanaged = [s for s in all_s if s.get("session_id") not in managed_ids]
+        if unmanaged:
+            print(f"\n{DIM}Other Claude sessions:{RST}")
+            for s in unmanaged[:10]:
+                nm = _trunc(s.get("name", "?"), 30)
+                sid = s.get("session_id", "")[:8]
+                upd = fmt_duration(s.get("updated", ""))
+                print(f"  {DIM}{nm:<30} {sid}...  {upd}{RST}")
+    return 0
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    name = args.name
+    if not tmux_window_exists(name):
+        print(f"{RED}Error:{RST} session '{name}' is not running.")
+        data = get_session(name)
+        if data:
+            print(f"  Resume: {BOLD}claude-mgr resume {name}{RST}")
+        return 1
+
+    data = get_session(name)
+    if data:
+        data["last_active"] = datetime.now().isoformat()
+        data["status"] = "running"
+        set_session(name, data)
+
+    # Select the window and attach
+    idx = _window_index(name)
+    if idx is not None:
+        run_ok([TMUX, "select-window", "-t", f"{TMUX_SESSION}:{idx}"])
+    os.execvp(TMUX, [TMUX, "attach-session", "-t", TMUX_SESSION])
+    return 0  # unreachable
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    name = args.name
+    if not tmux_window_exists(name):
+        print(f"{RED}Error:{RST} session '{name}' is not running.")
+        return 1
+
+    msg = " ".join(args.message)
+    if not tmux_send_keys(name, msg):
+        print(f"{RED}Error:{RST} failed to send to '{name}'")
+        return 1
+    if not args.no_enter:
+        tmux_send_enter(name)
+
+    print(f"{GREEN}Sent{RST} to '{name}': {_trunc(msg, 80)}")
+    data = get_session(name)
+    if data:
+        data["last_active"] = datetime.now().isoformat()
+        set_session(name, data)
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    name = args.name
+    data = get_session(name)
+    if not tmux_window_exists(name):
+        print(f"{YELLOW}Note:{RST} session '{name}' is already stopped.")
+        if data:
+            data["status"] = "stopped"
+            set_session(name, data)
+        return 0
+
+    tmux_kill_window(name)
+    if data:
+        data["status"] = "stopped"
+        data["last_active"] = datetime.now().isoformat()
+        set_session(name, data)
+    print(f"{GREEN}Stopped{RST} session '{name}'")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    name = args.name
+    if tmux_window_exists(name):
+        print(f"{YELLOW}Note:{RST} session '{name}' is already running.")
+        return cmd_attach(args)
+
+    data = get_session(name)
+    if not data:
+        print(f"{RED}Error:{RST} no record for session '{name}'.")
+        print(f"  Create new: {BOLD}claude-mgr new {name}{RST}")
+        return 1
+
+    session_id = data.get("session_id") if not args.fresh else None
+    cwd = data.get("cwd", os.getcwd())
+    task = data.get("task", "")
+
+    cmd_parts = ["claude"]
+    if session_id:
+        cmd_parts += ["--resume", session_id]
+        if name:
+            cmd_parts += ["--name", name]
+    else:
+        cmd_parts += ["--name", name]
+    if data.get("model"):
+        cmd_parts += ["--model", data["model"]]
+    if data.get("effort"):
+        cmd_parts += ["--effort", data["effort"]]
+    if task:
+        cmd_parts += ["--append-system-prompt",
+                      f"Your assigned task: {task}. Session name: {name}"]
+
+    if not tmux_create_window(name, cwd, cmd_parts):
+        print(f"{RED}Error:{RST} failed to create tmux window.")
+        return 1
+
+    data["status"] = "running"
+    data["last_active"] = datetime.now().isoformat()
+    if args.fresh:
+        data["session_id"] = None
+    set_session(name, data)
+
+    print(f"{GREEN}Resumed{RST} session '{name}'")
+    print(f"  Directory: {cwd}")
+    if session_id and not args.fresh:
+        print(f"  Session:   {session_id[:8]}...")
+    print(f"\nAttach: {BOLD}claude-mgr attach {name}{RST}")
+    return 0
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    name = args.name
+    if tmux_window_exists(name):
+        if not args.force:
+            print(f"Session '{name}' is running.")
+            print(f"  Stop first:   {BOLD}claude-mgr stop {name}{RST}")
+            print(f"  Force delete: {BOLD}claude-mgr delete {name} --force{RST}")
+            return 1
+        tmux_kill_window(name)
+
+    delete_session_record(name)
+    print(f"{GREEN}Deleted{RST} session '{name}'")
+    return 0
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    name = args.name
+    data = get_session(name)
+    if not data:
+        for s in find_claude_sessions():
+            if s.get("name") == name:
+                print(f"\n{BOLD}Claude session (not yet managed):{RST} {name}")
+                print(f"  Session ID:  {s['session_id']}")
+                print(f"  Directory:   {s['cwd']}")
+                print(f"  Last updated: {fmt_duration(s['updated'])}")
+                print(f"\nImport: {BOLD}claude-mgr import {name} "
+                      f"--session-id {s['session_id']}{RST}")
+                return 0
+        print(f"{RED}Error:{RST} session '{name}' not found.")
+        return 1
+
+    running = tmux_window_exists(name)
+    idx = _window_index(name)
+
+    print(f"\n{BOLD}{name}{RST}")
+    print_divider()
+    print(f"  Status:       {GREEN if running else DIM}"
+          f"{'● running' if running else '○ stopped'}{RST}")
+    if idx is not None:
+        print(f"  Tmux window:  {TMUX_SESSION}:{idx}")
+    print(f"  Directory:    {data.get('cwd', '-')}")
+    print(f"  Task:         {data.get('task') or DIM + '(none)' + RST}")
+    print(f"  Model:        {data.get('model') or 'default'}")
+    print(f"  Effort:       {data.get('effort') or 'default'}")
+    sid = data.get("session_id")
+    if sid:
+        print(f"  Claude ID:    {sid}")
+    print(f"  Created:      {data.get('created', '-')}")
+    print(f"  Last active:  {data.get('last_active', '-')} "
+          f"({fmt_duration(data.get('last_active', ''))})")
+
+    if running:
+        print(f"\n  {DIM}── Recent output ──{RST}")
+        content = tmux_capture_pane(name, lines=15)
+        if content.strip():
+            clean = _clean_ansi(content)
+            for line in clean.strip().split("\n")[-10:]:
+                if line.strip():
+                    print(f"  {DIM}│{RST} {line[:110]}")
+        else:
+            print(f"  {DIM}(no output yet){RST}")
+    print()
+    return 0
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    name = args.name
+    data = get_session(name)
+    if not data:
+        print(f"{RED}Error:{RST} session '{name}' not found.")
+        return 1
+
+    if args.task:
+        data["task"] = args.task
+        if tmux_window_exists(name):
+            tmux_send_keys(name, f"My updated task is: {args.task}")
+            tmux_send_enter(name)
+        set_session(name, data)
+        print(f"{GREEN}Updated{RST} task for '{name}': {args.task}")
+    else:
+        task = data.get("task", "")
+        if task:
+            print(f"Task for {BOLD}{name}{RST}: {task}")
+        else:
+            print(f"No task set for {BOLD}{name}{RST}.")
+    return 0
+
+
+def cmd_context(args: argparse.Namespace) -> int:
+    name = args.name
+    if not get_session(name):
+        print(f"{RED}Error:{RST} session '{name}' not found.")
+        return 1
+    if args.inject:
+        if not tmux_window_exists(name):
+            print(f"{RED}Error:{RST} session '{name}' is not running.")
+            return 1
+        tmux_send_keys(name, args.inject)
+        tmux_send_enter(name)
+        print(f"{GREEN}Injected{RST} context into '{name}'")
+        return 0
+    return cmd_info(args)
+
+
+def cmd_import_session(args: argparse.Namespace) -> int:
+    all_sessions = find_claude_sessions()
+    match = None
+    for s in all_sessions:
+        if (args.session_id and s.get("session_id") == args.session_id) or \
+           (args.from_name and s.get("name") == args.from_name):
+            match = s
+            break
+    if not match:
+        print(f"{RED}Error:{RST} session not found.")
+        print(f"List sessions: {BOLD}claude-mgr list --all{RST}")
+        return 1
+    if get_session(args.name):
+        print(f"{RED}Error:{RST} session '{args.name}' already exists.")
+        return 1
+
+    set_session(args.name, {
+        "name": args.name, "cwd": match.get("cwd", os.getcwd()),
+        "task": args.task or "",
+        "session_id": match["session_id"],
+        "created": match.get("updated", datetime.now().isoformat()),
+        "last_active": match.get("updated", datetime.now().isoformat()),
+        "status": "stopped",
+    })
+    print(f"{GREEN}Imported{RST} session as '{args.name}'")
+    print(f"  Session ID: {match['session_id'][:8]}...")
+    print(f"  Resume:     {BOLD}claude-mgr resume {args.name}{RST}")
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    """Show recent captured output from a running session."""
+    name = args.name
+    if not tmux_window_exists(name):
+        print(f"{RED}Error:{RST} session '{name}' is not running.")
+        return 1
+
+    content = tmux_capture_pane(name, lines=args.tail or 50)
+    clean = _clean_ansi(content)
+    lines = clean.split("\n")
+    if args.tail:
+        lines = lines[-args.tail:]
+
+    print(f"{BOLD}Output for '{name}'{RST}\n")
+    print_divider()
+    for line in lines:
+        print(line)
+    print_divider()
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    sessions = load_sessions()
+    out = {"exported_at": datetime.now().isoformat(), "sessions": {}}
+    for name, data in sessions.items():
+        entry = dict(data)
+        if tmux_window_exists(name):
+            entry["pane_snapshot"] = _clean_ansi(tmux_capture_pane(name, lines=20))
+        out["sessions"][name] = entry
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
+# ── dashboard ──────────────────────────────────────────────────────────────
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Show a live auto-refreshing dashboard of all sessions."""
+    refresh = max(args.refresh, 1)
+
+    try:
+        import termios, tty
+        has_termios = True
+    except ImportError:
+        has_termios = False
+
+    def draw():
+        sessions = load_sessions()
+        tmux_names = set(tmux_list_windows())
+        for sn in tmux_names:
+            if sn not in sessions:
+                sessions[sn] = {
+                    "name": sn, "cwd": "?", "task": "",
+                    "status": "running",
+                    "last_active": datetime.now().isoformat(),
+                }
+
+        sys.stdout.write("\033[2J\033[H")
+        now = datetime.now().strftime("%H:%M:%S")
+        title = "Claude Multi-Window Manager"
+        print(f"{BOLD}{CYAN}╔{'═' * 78}╗{RST}")
+        print(f"{BOLD}{CYAN}║{RST} {BOLD}{title}{RST}"
+              f"{' ' * max(0, 76 - len(title) - len(now))}{DIM}{now}{RST} {BOLD}{CYAN}║{RST}")
+        print(f"{BOLD}{CYAN}╠{'═' * 78}╣{RST}")
+
+        if not sessions:
+            print(f"{BOLD}{CYAN}║{RST} {DIM}No sessions yet.  Run: claude-mgr new <name>{RST}"
+                  f"{' ' * 38}{BOLD}{CYAN}║{RST}")
+        else:
+            def _sk(item):
+                n, d = item
+                return (0 if tmux_window_exists(n) else 1, d.get("last_active", ""))
+            sorted_s = sorted(sessions.items(), key=_sk)
+
+            for i, (name, data) in enumerate(sorted_s):
+                row = format_row(name, data)
+                print(f"{BOLD}{CYAN}║{RST} {row:<127}{BOLD}{CYAN}║{RST}")
+                if tmux_window_exists(name) and i < 6:
+                    content = tmux_capture_pane(name, lines=5)
+                    clean = _clean_ansi(content)
+                    for line in clean.strip().split("\n")[-4:]:
+                        if line.strip():
+                            print(f"{BOLD}{CYAN}║{RST} {DIM}  │ {line[:100]}{RST}")
+
+        print(f"{BOLD}{CYAN}╠{'═' * 78}╣{RST}")
+        running_n = sum(1 for n in sessions if tmux_window_exists(n))
+        total = len(sessions)
+        print(f"{BOLD}{CYAN}║{RST} {GREEN}● {running_n} running{RST}  "
+              f"{DIM}○ {total - running_n} stopped{RST}  "
+              f"refresh: {refresh}s  "
+              f"{DIM}[q]uit [r]efresh [n]ew [a]ttach{RST}"
+              f"{' ' * 13}{BOLD}{CYAN}║{RST}")
+        print(f"{BOLD}{CYAN}╚{'═' * 78}╝{RST}")
+        sys.stdout.flush()
+
+    old_settings = None
+    if has_termios:
+        try:
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except termios.error:
+            has_termios = False
+
+    try:
+        draw()
+        last_draw = time.time()
+        while True:
+            if has_termios:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
+                if rlist:
+                    ch = sys.stdin.read(1)
+                    if ch in ('q', 'Q', '\x1b'):
+                        break
+                    elif ch in ('r', 'R'):
+                        draw(); last_draw = time.time()
+                        continue
+            else:
+                time.sleep(refresh)
+            if time.time() - last_draw >= refresh:
+                draw(); last_draw = time.time()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if old_settings:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+    print()
+    return 0
+
+
+# ── CLI parser ─────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="claude-mgr",
+        description="Manage multiple Claude Code sessions in tmux windows.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+        Examples:
+          claude-mgr new backend --task "Build REST API endpoints"
+          claude-mgr new frontend --task "Create React dashboard"
+          claude-mgr ls
+          claude-mgr dashboard
+          claude-mgr attach backend
+          claude-mgr send backend "run the tests"
+          claude-mgr stop backend
+          claude-mgr resume backend
+          claude-mgr info backend
+          claude-mgr log backend --tail 30
+        """),
+    )
+    sub = p.add_subparsers(dest="command", help="Available commands")
+
+    sub.add_parser("setup", help="Install/check tmux and initialize")
+
+    p_new = sub.add_parser("new", help="Create a new Claude session window")
+    p_new.add_argument("name", help="Session name")
+    p_new.add_argument("--dir", "-d", help="Working directory")
+    p_new.add_argument("--task", "-t", help="Task description")
+    p_new.add_argument("--model", "-m", help="Claude model")
+    p_new.add_argument("--effort", "-e", help="Effort level")
+    p_new.add_argument("--session-id", help="Claude session ID to resume")
+    p_new.add_argument("--resume-from", help="Resume named Claude session")
+
+    p_list = sub.add_parser("list", aliases=["ls"], help="List all sessions")
+    p_list.add_argument("--all", "-a", action="store_true",
+                        help="Also show unmanaged Claude sessions")
+
+    p_att = sub.add_parser("attach", aliases=["at"], help="Attach to a session")
+    p_att.add_argument("name", help="Session name")
+
+    p_send = sub.add_parser("send", help="Send a message to a session")
+    p_send.add_argument("name", help="Target session name")
+    p_send.add_argument("message", nargs="+", help="Message text")
+    p_send.add_argument("--no-enter", "-n", action="store_true",
+                        help="Don't press Enter after typing")
+
+    p_stop = sub.add_parser("stop", help="Stop a session (keep record)")
+    p_stop.add_argument("name", help="Session name")
+
+    p_res = sub.add_parser("resume", help="Resume a stopped session")
+    p_res.add_argument("name", help="Session name")
+    p_res.add_argument("--fresh", "-f", action="store_true",
+                       help="Start fresh (don't resume previous conversation)")
+
+    p_del = sub.add_parser("delete", aliases=["rm"],
+                           help="Delete a session permanently")
+    p_del.add_argument("name", help="Session name")
+    p_del.add_argument("--force", "-f", action="store_true",
+                       help="Force delete even if running")
+
+    p_info = sub.add_parser("info", help="Show detailed session info")
+    p_info.add_argument("name", help="Session name")
+
+    p_task = sub.add_parser("task", help="Set or view a session's task")
+    p_task.add_argument("name", help="Session name")
+    p_task.add_argument("task", nargs="?", help="New task description")
+
+    p_ctx = sub.add_parser("context", aliases=["ctx"],
+                           help="Inject context into a running session")
+    p_ctx.add_argument("name", help="Session name")
+    p_ctx.add_argument("--inject", "-i", help="Text to inject")
+
+    p_imp = sub.add_parser("import", help="Import an existing Claude session")
+    p_imp.add_argument("name", help="Name for the imported session")
+    p_imp.add_argument("--session-id", help="Claude session ID")
+    p_imp.add_argument("--from-name", help="Import by Claude session name")
+    p_imp.add_argument("--task", "-t", help="Task description")
+
+    sub.add_parser("export", help="Export all session data as JSON")
+
+    p_log = sub.add_parser("log", help="Show captured session output")
+    p_log.add_argument("name", help="Session name")
+    p_log.add_argument("--tail", "-n", type=int, help="Show last N lines only")
+
+    p_dash = sub.add_parser("dashboard", aliases=["dash", "db"],
+                            help="Show live dashboard")
+    p_dash.add_argument("--refresh", "-r", type=int, default=3,
+                        help="Refresh interval in seconds (default: 3)")
+
+    return p
+
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+COMMAND_MAP = {
+    "setup":     cmd_setup,
+    "new":       cmd_new,
+    "list":      cmd_list,     "ls": cmd_list,
+    "attach":    cmd_attach,   "at": cmd_attach,
+    "send":      cmd_send,
+    "stop":      cmd_stop,
+    "resume":    cmd_resume,
+    "delete":    cmd_delete,   "rm": cmd_delete,
+    "info":      cmd_info,
+    "task":      cmd_task,
+    "context":   cmd_context,  "ctx": cmd_context,
+    "import":    cmd_import_session,
+    "export":    cmd_export,
+    "log":       cmd_log,
+    "dashboard": cmd_dashboard,"dash": cmd_dashboard, "db": cmd_dashboard,
+}
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    handler = COMMAND_MAP.get(args.command)
+    if not handler:
+        parser.print_help()
+        return 1
+
+    try:
+        return handler(args)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.strip() if e.stderr else str(e)
+        print(f"{RED}Error:{RST} {err}")
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
