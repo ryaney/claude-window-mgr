@@ -100,11 +100,9 @@ def _run(cmd: list[str], check: bool = True, silent: bool = True,
                           check=check, timeout=timeout)
 
 
-def run_ok(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    try:
-        return _run(cmd, check=True, **kw)
-    except subprocess.CalledProcessError as e:
-        return e
+def run_ok(cmd: list[str], silent: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run a command without raising on non-zero exit."""
+    return _run(cmd, check=False, silent=silent, timeout=timeout)
 
 
 # ── tmux backend ───────────────────────────────────────────────────────────
@@ -248,7 +246,14 @@ def load_sessions() -> dict:
         return {}
     try:
         return json.loads(SESSIONS_FILE.read_text()).get("sessions", {})
-    except (json.JSONDecodeError, KeyError):
+    except (json.JSONDecodeError, KeyError) as e:
+        log(f"WARN: corrupted sessions file ({e}), starting fresh")
+        corrupted = SESSIONS_FILE.with_suffix(".json.corrupted")
+        try:
+            SESSIONS_FILE.rename(corrupted)
+            log(f"Backed up corrupted file to {corrupted}")
+        except OSError:
+            pass
         return {}
 
 
@@ -334,16 +339,58 @@ def fmt_duration(iso_str: str) -> str:
         return "?"
 
 
+def _display_width(s: str) -> int:
+    """Return the display width of a string, accounting for CJK wide characters."""
+    width = 0
+    for ch in s:
+        cp = ord(ch)
+        if (0x1100 <= cp <= 0x11FF or
+            0x2E80 <= cp <= 0x303F or
+            0x3130 <= cp <= 0x33FF or
+            0x3400 <= cp <= 0x9FFF or
+            0xF900 <= cp <= 0xFAFF or
+            0xFE10 <= cp <= 0xFE19 or
+            0xFE30 <= cp <= 0xFE6F or
+            0xFF01 <= cp <= 0xFF60 or
+            0xFFE0 <= cp <= 0xFFE6):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
 def _trunc(s: str, n: int) -> str:
-    return s if len(s) <= n else s[:n-1] + "…"
+    """Truncate a string to n display columns, appending … if truncated."""
+    s = s or ""
+    if _display_width(s) <= n:
+        return s
+    result = []
+    w = 0
+    for ch in s:
+        cw = 2 if _display_width(ch) == 2 else 1
+        if w + cw > n - 1:
+            break
+        result.append(ch)
+        w += cw
+    return "".join(result) + "…"
+
+
+def _pad(s: str, width: int) -> str:
+    """Pad a string with spaces to a given display width."""
+    return s + " " * max(0, width - _display_width(s))
 
 
 def _clean_ansi(text: str) -> str:
     """Strip ANSI escape sequences for clean terminal display."""
-    c = re.sub(r'\x1b\[[?>]?[0-9;]*[a-zA-Z]', '', text)
-    c = re.sub(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', '', c)
-    c = re.sub(r'\x1b[^\x1b]', '', c)
-    return c.replace('\x0f', '')
+    # CSI sequences: ESC [ param... byte
+    c = re.sub(r'\x1b\[[?>]?[\d;]*[a-zA-Z]', '', text)
+    # OSC sequences: ESC ] text (ST|BEL)
+    c = re.sub(r'\x1b\].*?(\x07|\x1b\\)', '', c)
+    # Remaining C1 control characters (ESC + printable ASCII, e.g. \x1b7, \x1bM, \x1b=)
+    c = re.sub(r'\x1b[\x30-\x7e]', '', c)
+    # Strip leftover bare ESC and other C0 controls (keep \t, \n, \r)
+    c = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x1b]', '', c)
+    return c
 
 
 def format_row(name: str, data: dict) -> str:
@@ -356,10 +403,10 @@ def format_row(name: str, data: dict) -> str:
     last = fmt_duration(data.get("last_active", ""))
     idx  = _window_index(name)
     idx_str = f"w{idx}" if idx is not None else "-"
-    return (f" {icon_str} {BOLD}{name:<20}{RST} "
-            f"{DIM}{idx_str:<4}{RST} "
-            f"{task:<44} "
-            f"{DIM}{cwd:<34}{RST} "
+    return (f" {icon_str} {BOLD}{_pad(name, 20)}{RST} "
+            f"{DIM}{_pad(idx_str, 4)}{RST} "
+            f"{_pad(task, 44)} "
+            f"{DIM}{_pad(cwd, 34)}{RST} "
             f"{DIM}{last}{RST}")
 
 
