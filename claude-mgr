@@ -36,7 +36,6 @@ import re
 import select
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import textwrap
@@ -100,9 +99,10 @@ def _run(cmd: list[str], check: bool = True, silent: bool = True,
                           check=check, timeout=timeout)
 
 
-def run_ok(cmd: list[str], silent: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
-    """Run a command without raising on non-zero exit."""
-    return _run(cmd, check=False, silent=silent, timeout=timeout)
+def run_ok(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    """Run a command without raising on non-zero exit.  Forwards all other
+    keyword arguments to _run transparently."""
+    return _run(cmd, check=False, **kw)
 
 
 # ── tmux backend ───────────────────────────────────────────────────────────
@@ -160,11 +160,11 @@ def _tmux_session_alive() -> bool:
 def _window_index(name: str) -> int | None:
     """Get the window index for a named window."""
     p = run_ok([TMUX, "list-windows", "-t", TMUX_SESSION,
-                "-F", "#{window_index} #{window_name}"])
+                "-F", "#{window_index}|#{window_name}"])
     for line in p.stdout.strip().split("\n"):
         if not line:
             continue
-        parts = line.split(" ", 1)
+        parts = line.split("|", 1)
         if len(parts) == 2 and parts[1] == name:
             return int(parts[0])
     return None
@@ -259,11 +259,22 @@ def load_sessions() -> dict:
 
 def save_sessions(sessions: dict) -> None:
     MGR_DIR.mkdir(parents=True, exist_ok=True)
-    SESSIONS_FILE.write_text(json.dumps({
+    payload = json.dumps({
         "version": 3,
         "updated": datetime.now().isoformat(),
         "sessions": sessions,
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=False)
+    tmp = SESSIONS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(payload)
+    tmp.rename(SESSIONS_FILE)
+
+
+def _lookup_session_id_by_name(name: str) -> str | None:
+    """Try to find a Claude session ID by display name from ~/.claude/projects/."""
+    for s in find_claude_sessions():
+        if s.get("name") == name:
+            return s["session_id"]
+    return None
 
 
 def get_session(name: str) -> dict | None:
@@ -272,8 +283,10 @@ def get_session(name: str) -> dict | None:
     if data:
         return data
     if tmux_window_exists(name):
+        sid = _lookup_session_id_by_name(name)
         return {
             "name": name, "cwd": os.getcwd(), "task": "",
+            "session_id": sid,
             "status": "running",
             "last_active": datetime.now().isoformat(),
         }
@@ -290,6 +303,20 @@ def delete_session_record(name: str) -> None:
     sessions = load_sessions()
     sessions.pop(name, None)
     save_sessions(sessions)
+
+
+def _merge_orphan_windows(sessions: dict, cwd: str = "?") -> dict:
+    """Add running tmux windows not yet in the session store."""
+    for sn in tmux_list_windows():
+        if sn not in sessions:
+            sid = _lookup_session_id_by_name(sn)
+            sessions[sn] = {
+                "name": sn, "cwd": cwd, "task": "",
+                "session_id": sid,
+                "status": "running",
+                "last_active": datetime.now().isoformat(),
+            }
+    return sessions
 
 
 # ── claude session discovery ───────────────────────────────────────────────
@@ -339,12 +366,9 @@ def fmt_duration(iso_str: str) -> str:
         return "?"
 
 
-def _display_width(s: str) -> int:
-    """Return the display width of a string, accounting for CJK wide characters."""
-    width = 0
-    for ch in s:
-        cp = ord(ch)
-        if (0x1100 <= cp <= 0x11FF or
+def _is_wide_cjk(cp: int) -> bool:
+    """Return True if codepoint is a CJK wide character (2 columns)."""
+    return (0x1100 <= cp <= 0x11FF or
             0x2E80 <= cp <= 0x303F or
             0x3130 <= cp <= 0x33FF or
             0x3400 <= cp <= 0x9FFF or
@@ -352,11 +376,12 @@ def _display_width(s: str) -> int:
             0xFE10 <= cp <= 0xFE19 or
             0xFE30 <= cp <= 0xFE6F or
             0xFF01 <= cp <= 0xFF60 or
-            0xFFE0 <= cp <= 0xFFE6):
-            width += 2
-        else:
-            width += 1
-    return width
+            0xFFE0 <= cp <= 0xFFE6)
+
+
+def _display_width(s: str) -> int:
+    """Return the display width of a string, accounting for CJK wide characters."""
+    return sum(2 if _is_wide_cjk(ord(ch)) else 1 for ch in s)
 
 
 def _trunc(s: str, n: int) -> str:
@@ -367,7 +392,7 @@ def _trunc(s: str, n: int) -> str:
     result = []
     w = 0
     for ch in s:
-        cw = 2 if _display_width(ch) == 2 else 1
+        cw = 2 if _is_wide_cjk(ord(ch)) else 1
         if w + cw > n - 1:
             break
         result.append(ch)
@@ -438,7 +463,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
             if p.returncode == 0:
                 print(f"  {GREEN}✓{RST} tmux installed via Homebrew")
             else:
-                print(f"  {YELLOW}!{RST} brew install failed — trying source build...")
+                err = p.stderr.strip() if p.stderr else "unknown error"
+                print(f"  {YELLOW}!{RST} brew install failed ({err}) — trying source build...")
                 return _build_tmux()
         else:
             return _build_tmux()
@@ -498,6 +524,22 @@ def _build_tmux() -> int:
         return 1
 
 
+def _build_claude_cmd(name: str, session_id: str | None = None,
+                      model: str = "", effort: str = "", task: str = "") -> list[str]:
+    """Build the claude CLI argument list for a session."""
+    cmd = ["claude", "--name", name]
+    if session_id:
+        cmd += ["--resume", session_id]
+    if model:
+        cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
+    if task:
+        cmd += ["--append-system-prompt",
+                f"Your assigned task: {task}. Session name: {name}"]
+    return cmd
+
+
 def cmd_new(args: argparse.Namespace) -> int:
     """Create a new Claude session in a tmux window."""
     name = args.name
@@ -515,7 +557,6 @@ def cmd_new(args: argparse.Namespace) -> int:
         print(f"  Resume: {BOLD}claude-mgr resume {name}{RST}")
         return 1
 
-    # Resolve session_id
     session_id = args.session_id
     if args.resume_from:
         for s in find_claude_sessions():
@@ -529,21 +570,10 @@ def cmd_new(args: argparse.Namespace) -> int:
 
     cwd = args.dir or os.getcwd()
     task = args.task or ""
+    model = args.model or ""
+    effort = args.effort or ""
 
-    cmd_parts = ["claude"]
-    if session_id:
-        cmd_parts += ["--resume", session_id]
-        if name:
-            cmd_parts += ["--name", name]
-    else:
-        cmd_parts += ["--name", name]
-    if args.model:
-        cmd_parts += ["--model", args.model]
-    if args.effort:
-        cmd_parts += ["--effort", args.effort]
-    if task:
-        cmd_parts += ["--append-system-prompt",
-                      f"Your assigned task: {task}. Session name: {name}"]
+    cmd_parts = _build_claude_cmd(name, session_id, model, effort, task)
 
     if not tmux_create_window(name, cwd, cmd_parts):
         print(f"{RED}Error:{RST} failed to create tmux window.")
@@ -551,7 +581,7 @@ def cmd_new(args: argparse.Namespace) -> int:
 
     set_session(name, {
         "name": name, "cwd": cwd, "task": task,
-        "model": args.model or "", "effort": args.effort or "",
+        "model": model, "effort": effort,
         "session_id": session_id,
         "created": datetime.now().isoformat(),
         "last_active": datetime.now().isoformat(),
@@ -569,38 +599,27 @@ def cmd_new(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    sessions = load_sessions()
-    tmux_names = set(tmux_list_windows())
-    for sn in tmux_names:
-        if sn not in sessions:
-            sessions[sn] = {
-                "name": sn, "cwd": os.getcwd(), "task": "",
-                "status": "running",
-                "last_active": datetime.now().isoformat(),
-            }
+    sessions = _merge_orphan_windows(load_sessions(), cwd=os.getcwd())
 
     if not sessions:
         print(f"{DIM}No sessions yet.{RST}")
         print(f"Create: {BOLD}claude-mgr new <name> --task \"...\"{RST}")
         return 0
 
-    for name, data in sessions.items():
-        data["_running"] = tmux_window_exists(name)
+    running_names = {n for n in sessions if tmux_window_exists(n)}
 
     print(f"\n{BOLD}Claude Sessions{RST}\n")
     print_divider()
     print(f" {' ':<1} {BOLD}{'NAME':<20} {'WIN':<4} {'TASK':<44} {'DIR':<34} {'LAST ACTIVE'}{RST}")
     print_divider()
 
-    def _sk(item):
-        name, data = item
-        return (0 if data.get("_running") else 1, data.get("last_active", ""))
-
-    for name, data in sorted(sessions.items(), key=_sk):
+    for name, data in sorted(sessions.items(),
+                             key=lambda x: (x[0] not in running_names,
+                                            x[1].get("last_active", ""))):
         print(format_row(name, data))
 
     print_divider()
-    running = sum(1 for d in sessions.values() if d.get("_running"))
+    running = len(running_names)
     print(f"{GREEN}● {running} running{RST}  "
           f"{DIM}○ {len(sessions) - running} stopped{RST}  "
           f"total: {len(sessions)}  "
@@ -650,6 +669,9 @@ def cmd_send(args: argparse.Namespace) -> int:
         return 1
 
     msg = " ".join(args.message)
+    if not msg.strip():
+        print(f"{RED}Error:{RST} empty message not allowed.")
+        return 1
     if not tmux_send_keys(name, msg):
         print(f"{RED}Error:{RST} failed to send to '{name}'")
         return 1
@@ -699,20 +721,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
     cwd = data.get("cwd", os.getcwd())
     task = data.get("task", "")
 
-    cmd_parts = ["claude"]
-    if session_id:
-        cmd_parts += ["--resume", session_id]
-        if name:
-            cmd_parts += ["--name", name]
-    else:
-        cmd_parts += ["--name", name]
-    if data.get("model"):
-        cmd_parts += ["--model", data["model"]]
-    if data.get("effort"):
-        cmd_parts += ["--effort", data["effort"]]
-    if task:
-        cmd_parts += ["--append-system-prompt",
-                      f"Your assigned task: {task}. Session name: {name}"]
+    cmd_parts = _build_claude_cmd(
+        name, session_id,
+        model=data.get("model", ""),
+        effort=data.get("effort", ""),
+        task=task,
+    )
 
     if not tmux_create_window(name, cwd, cmd_parts):
         print(f"{RED}Error:{RST} failed to create tmux window.")
@@ -788,7 +802,7 @@ def cmd_info(args: argparse.Namespace) -> int:
         content = tmux_capture_pane(name, lines=15)
         if content.strip():
             clean = _clean_ansi(content)
-            for line in clean.strip().split("\n")[-10:]:
+            for line in clean.strip().splitlines()[-10:]:
                 if line.strip():
                     print(f"  {DIM}│{RST} {line[:110]}")
         else:
@@ -832,6 +846,7 @@ def cmd_context(args: argparse.Namespace) -> int:
         tmux_send_keys(name, args.inject)
         tmux_send_enter(name)
         print(f"{GREEN}Injected{RST} context into '{name}'")
+        print(f"  Content: {_trunc(args.inject, 80)}")
         return 0
     return cmd_info(args)
 
@@ -875,11 +890,13 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     content = tmux_capture_pane(name, lines=args.tail or 50)
     clean = _clean_ansi(content)
-    lines = clean.split("\n")
+    lines = clean.splitlines()
     if args.tail:
         lines = lines[-args.tail:]
 
-    print(f"{BOLD}Output for '{name}'{RST}\n")
+    captured_at = datetime.now().strftime("%H:%M:%S")
+    print(f"{BOLD}Output for '{name}'{RST}  "
+          f"{DIM}(captured at {captured_at} — may still be streaming){RST}\n")
     print_divider()
     for line in lines:
         print(line)
@@ -912,27 +929,22 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         has_termios = False
 
     def draw():
-        sessions = load_sessions()
-        tmux_names = set(tmux_list_windows())
-        for sn in tmux_names:
-            if sn not in sessions:
-                sessions[sn] = {
-                    "name": sn, "cwd": "?", "task": "",
-                    "status": "running",
-                    "last_active": datetime.now().isoformat(),
-                }
+        sessions = _merge_orphan_windows(load_sessions(), cwd="?")
 
         sys.stdout.write("\033[2J\033[H")
         now = datetime.now().strftime("%H:%M:%S")
         title = "Claude Multi-Window Manager"
-        print(f"{BOLD}{CYAN}╔{'═' * 78}╗{RST}")
+        w = min(shutil.get_terminal_size((120, 40)).columns - 2, 120)
+        inner = w - 2
+        print(f"{BOLD}{CYAN}╔{'═' * inner}╗{RST}")
         print(f"{BOLD}{CYAN}║{RST} {BOLD}{title}{RST}"
-              f"{' ' * max(0, 76 - len(title) - len(now))}{DIM}{now}{RST} {BOLD}{CYAN}║{RST}")
-        print(f"{BOLD}{CYAN}╠{'═' * 78}╣{RST}")
+              f"{' ' * max(0, inner - 1 - len(title) - len(now))}{DIM}{now}{RST} {BOLD}{CYAN}║{RST}")
+        print(f"{BOLD}{CYAN}╠{'═' * inner}╣{RST}")
 
         if not sessions:
-            print(f"{BOLD}{CYAN}║{RST} {DIM}No sessions yet.  Run: claude-mgr new <name>{RST}"
-                  f"{' ' * 38}{BOLD}{CYAN}║{RST}")
+            msg = f"{DIM}No sessions yet.  Run: claude-mgr new <name>{RST}"
+            print(f"{BOLD}{CYAN}║{RST} {msg}"
+                  f"{' ' * max(0, inner - 1 - len(msg) + len(DIM) + len(RST))}{BOLD}{CYAN}║{RST}")
         else:
             def _sk(item):
                 n, d = item
@@ -941,23 +953,25 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
             for i, (name, data) in enumerate(sorted_s):
                 row = format_row(name, data)
-                print(f"{BOLD}{CYAN}║{RST} {row:<127}{BOLD}{CYAN}║{RST}")
+                print(f"{BOLD}{CYAN}║{RST} {row}"
+                      f"{' ' * max(0, inner - 1 - len(row))}{BOLD}{CYAN}║{RST}")
                 if tmux_window_exists(name) and i < 6:
                     content = tmux_capture_pane(name, lines=5)
                     clean = _clean_ansi(content)
-                    for line in clean.strip().split("\n")[-4:]:
+                    for line in clean.strip().splitlines()[-4:]:
                         if line.strip():
-                            print(f"{BOLD}{CYAN}║{RST} {DIM}  │ {line[:100]}{RST}")
+                            print(f"{BOLD}{CYAN}║{RST} {DIM}  │ {line[:inner - 6]}{RST}")
 
-        print(f"{BOLD}{CYAN}╠{'═' * 78}╣{RST}")
+        print(f"{BOLD}{CYAN}╠{'═' * inner}╣{RST}")
         running_n = sum(1 for n in sessions if tmux_window_exists(n))
         total = len(sessions)
-        print(f"{BOLD}{CYAN}║{RST} {GREEN}● {running_n} running{RST}  "
-              f"{DIM}○ {total - running_n} stopped{RST}  "
-              f"refresh: {refresh}s  "
-              f"{DIM}[q]uit [r]efresh [n]ew [a]ttach{RST}"
-              f"{' ' * 13}{BOLD}{CYAN}║{RST}")
-        print(f"{BOLD}{CYAN}╚{'═' * 78}╝{RST}")
+        footer = (f"{GREEN}● {running_n} running{RST}  "
+                  f"{DIM}○ {total - running_n} stopped{RST}  "
+                  f"refresh: {refresh}s  "
+                  f"{DIM}[q]uit [r]efresh [n]ew [a]ttach{RST}")
+        print(f"{BOLD}{CYAN}║{RST} {footer}"
+              f"{' ' * max(0, inner - 1 - _display_width(f'● {running_n} running  ○ {total - running_n} stopped  refresh: {refresh}s  [q]uit [r]efresh [n]ew [a]ttach'))}{BOLD}{CYAN}║{RST}")
+        print(f"{BOLD}{CYAN}╚{'═' * inner}╝{RST}")
         sys.stdout.flush()
 
     old_settings = None
@@ -979,7 +993,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                     ch = sys.stdin.read(1)
                     if ch in ('q', 'Q', '\x1b'):
                         break
-                    elif ch in ('r', 'R'):
+                    elif ch in ('r', 'R') and time.time() - last_draw > 0.5:
                         draw(); last_draw = time.time()
                         continue
             else:
